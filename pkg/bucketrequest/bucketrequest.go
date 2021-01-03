@@ -62,6 +62,11 @@ func (b *bucketRequestListener) Add(ctx context.Context, obj *v1alpha1.BucketReq
 // update processes any updates  made to the bucket request
 func (b *bucketRequestListener) Update(ctx context.Context, old, new *v1alpha1.BucketRequest) error {
 	glog.V(3).Infof("Update called for BucketRequest  %v", old.Name)
+	if (old.ObjectMeta.DeletionTimestamp == nil) &&
+		(new.ObjectMeta.DeletionTimestamp != nil) {
+		// BucketRequest is being deleted, check and remove finalizer once BA is deleted
+		return b.removeBucket(ctx, new)
+	}
 	return nil
 }
 
@@ -128,6 +133,10 @@ func (b *bucketRequestListener) provisionBucketRequestOperation(ctx context.Cont
 		return err
 	}
 
+	if !util.CheckFinalizer(bucketRequest, util.BRDeleteFinalizer) {
+		bucketRequest.ObjectMeta.Finalizers = append(bucketRequest.ObjectMeta.Finalizers, util.BRDeleteFinalizer)
+	}
+
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		bucketRequest.Spec.BucketInstanceName = bucket.Name
 		_, err := b.bucketClient.ObjectstorageV1alpha1().BucketRequests(bucketRequest.Namespace).Update(ctx, bucketRequest, metav1.UpdateOptions{})
@@ -141,6 +150,24 @@ func (b *bucketRequestListener) provisionBucketRequestOperation(ctx context.Cont
 	}
 	glog.Infof("Finished creating Bucket %v", bucket.Name)
 	return nil
+}
+
+// When a BR is deleted before the finalizer is removed then the bucket corresponding to the BR should be deleted.
+func (b *bucketRequestListener) removeBucket(ctx context.Context, bucketRequest *v1alpha1.BucketRequest) error {
+	bucket := b.FindBucket(ctx, bucketRequest)
+	if bucket == nil {
+		// bucket for this BucketRequest is not found
+		return util.ErrBucketDoesNotExist
+	}
+
+	// time to delete the Bucket Object
+	err := b.bucketClient.ObjectstorageV1alpha1().Buckets().Delete(context.Background(), bucket.Name, metav1.DeleteOptions{})
+	if err != nil {
+		return err
+	}
+
+	// we can safely remove the finalizer
+	return b.removeBRDeleteFinalizer(ctx, bucketRequest)
 }
 
 // GetBucketClass returns BucketClassName. If no bucket class was in the request it returns empty
@@ -171,6 +198,19 @@ func (b *bucketRequestListener) FindBucket(ctx context.Context, br *v1alpha1.Buc
 		}
 	}
 	return nil
+}
+
+func (b *bucketRequestListener) removeBRDeleteFinalizer(ctx context.Context, bucketRequest *v1alpha1.BucketRequest) error {
+	newFinalizers := []string{}
+	for _, finalizer := range bucketRequest.ObjectMeta.Finalizers {
+		if finalizer != util.BRDeleteFinalizer {
+			newFinalizers = append(newFinalizers, finalizer)
+		}
+	}
+	bucketRequest.ObjectMeta.Finalizers = newFinalizers
+
+	_, err := b.bucketClient.ObjectstorageV1alpha1().BucketRequests(bucketRequest.Namespace).Update(ctx, bucketRequest, metav1.UpdateOptions{})
+	return err
 }
 
 // cloneTheBucket clones a bucket to a different namespace when a BR is for brownfield.

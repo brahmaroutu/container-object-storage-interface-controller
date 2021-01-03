@@ -34,8 +34,9 @@ func (b *bucketAccessRequestListener) InitializeBucketClient(bc bucketclientset.
 	b.bucketClient = bc
 }
 
+// Add is in response to user adding a BucketAccessRequest. The call here will respond by creating a BucketAccess Object.
 func (b *bucketAccessRequestListener) Add(ctx context.Context, obj *v1alpha1.BucketAccessRequest) error {
-	glog.V(1).Infof("Add called for BucketAccessRequest %s", obj.Name)
+	glog.V(1).Infof("Add called for BucketAccessRequest %v/%v", obj.Namespace, obj.Name)
 	bucketAccessRequest := obj
 
 	err := b.provisionBucketAccess(ctx, bucketAccessRequest)
@@ -43,25 +44,35 @@ func (b *bucketAccessRequestListener) Add(ctx context.Context, obj *v1alpha1.Buc
 		// Provisioning is 100% finished / not in progress.
 		switch err {
 		case util.ErrBucketAccessAlreadyExists:
-			glog.V(1).Infof("BucketAccess already exist for this BucketAccessRequest %v.", bucketAccessRequest.Name)
+			glog.V(1).Infof("BucketAccess already exist for this BucketAccessRequest %v/%v.", bucketAccessRequest.Namespace, bucketAccessRequest.Name)
 			err = nil
 		default:
-			glog.V(1).Infof("Error occurred processing BucketAccessRequest %v: %v", bucketAccessRequest.Name, err)
+			glog.V(1).Infof("Error occurred processing BucketAccessRequest %v/%v: %v", bucketAccessRequest.Namespace, bucketAccessRequest.Name, err)
 		}
 		return err
 	}
 
-	glog.V(1).Infof("BucketAccessRequest %v is successfully processed.", bucketAccessRequest.Name)
+	glog.V(1).Infof("BucketAccessRequest %v/%v is successfully processed.", bucketAccessRequest.Namespace, bucketAccessRequest.Name)
 	return nil
 }
 
+// Update is called in response to a change to BucketAccessRequest. At this point
+// BucketAccess cannot be changed once created as the Provisioner might have already acted upon the create BucketAccess and created the backend Bucket Credentials
+// Changes to Protocol, Provisioner, BucketInstanceName, BucketRequest cannot be allowed. Best is to delete and recreate a new BucketAccessRequest
+// Changes to ServiceAccount, PolicyActionsConfigMapData and Parameters should be considered in lieu with sidecar implementation
 func (b *bucketAccessRequestListener) Update(ctx context.Context, old, new *v1alpha1.BucketAccessRequest) error {
-	glog.V(1).Infof("Update called for BucketAccessRequest %v", old.Name)
+	glog.V(1).Infof("Update called for BucketAccessRequest %v/%v", old.Namespace, old.Name)
+	if new.ObjectMeta.DeletionTimestamp != nil {
+		// BucketAccessRequest is being deleted, check and remove finalizer once BA is deleted
+		return b.removeBucketAccess(ctx, new)
+	}
 	return nil
 }
 
-func (b *bucketAccessRequestListener) Delete(ctx context.Context, obj *v1alpha1.BucketAccessRequest) error {
-	glog.V(1).Infof("Delete called for BucketAccessRequest %v", obj.Name)
+// Delete is in response to user deleting a BucketAccessRequest. The call here will respond by deleting a BucketAccess Object.
+func (b *bucketAccessRequestListener) Delete(ctx context.Context, bucketAccessRequest *v1alpha1.BucketAccessRequest) error {
+	glog.V(1).Infof("Delete called for BucketAccessRequest %v/%v", bucketAccessRequest.Namespace, bucketAccessRequest.Name)
+
 	return nil
 }
 
@@ -137,10 +148,10 @@ func (b *bucketAccessRequestListener) provisionBucketAccess(ctx context.Context,
 	}
 	// bucketaccess.Spec.MintedSecretName - set by the driver
 	bucketaccess.Spec.PolicyActionsConfigMapData, err = util.ReadConfigData(b.kubeClient, bucketAccessClass.PolicyActionsConfigMap)
-	if err != nil {
+	if err != nil && err != util.ErrNilConfigMap {
 		return err
 	}
-	//  bucketaccess.Spec.Principal - set by the driver
+	//  bucketaccess.Spec.Principal - set by the provisioner
 	bucketaccess.Spec.Provisioner = bucketAccessClass.Provisioner
 	bucketaccess.Spec.Parameters = util.CopySS(bucketAccessClass.Parameters)
 
@@ -150,6 +161,10 @@ func (b *bucketAccessRequestListener) provisionBucketAccess(ctx context.Context,
 			return nil
 		}
 		return err
+	}
+
+	if !util.CheckFinalizer(bucketAccessRequest, util.BARDeleteFinalizer) {
+		bucketAccessRequest.ObjectMeta.Finalizers = append(bucketAccessRequest.ObjectMeta.Finalizers, util.BARDeleteFinalizer)
 	}
 
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -167,17 +182,47 @@ func (b *bucketAccessRequestListener) provisionBucketAccess(ctx context.Context,
 	return nil
 }
 
-func (b *bucketAccessRequestListener) FindBucketAccess(ctx context.Context, bar *v1alpha1.BucketAccessRequest) *v1alpha1.BucketAccess {
+func (b *bucketAccessRequestListener) removeBucketAccess(ctx context.Context, bucketAccessRequest *v1alpha1.BucketAccessRequest) error {
+	bucketaccess := b.FindBucketAccess(ctx, bucketAccessRequest)
+	if bucketaccess == nil {
+		// bucketaccess for this BucketAccessRequest is not found
+		return util.ErrBucketAccessDoesNotExist
+	}
+
+	// time to delete the BucketAccess Object
+	err := b.bucketClient.ObjectstorageV1alpha1().BucketAccesses().Delete(context.Background(), bucketaccess.Name, metav1.DeleteOptions{})
+	if err != nil {
+		return err
+	}
+
+	// we can safely remove the finalizer
+	return b.removeBARDeleteFinalizer(ctx, bucketAccessRequest)
+}
+
+func (b *bucketAccessRequestListener) FindBucketAccess(ctx context.Context, bucketAccessRequest *v1alpha1.BucketAccessRequest) *v1alpha1.BucketAccess {
 	bucketAccessList, err := b.bucketClient.ObjectstorageV1alpha1().BucketAccesses().List(ctx, metav1.ListOptions{})
 	if err != nil || len(bucketAccessList.Items) <= 0 {
 		return nil
 	}
 	for _, bucketaccess := range bucketAccessList.Items {
-		if bucketaccess.Spec.BucketAccessRequest.Name == bar.Name &&
-			bucketaccess.Spec.BucketAccessRequest.Namespace == bar.Namespace &&
-			bucketaccess.Spec.BucketAccessRequest.UID == bar.UID {
+		if bucketaccess.Spec.BucketAccessRequest.Name == bucketAccessRequest.Name &&
+			bucketaccess.Spec.BucketAccessRequest.Namespace == bucketAccessRequest.Namespace &&
+			bucketaccess.Spec.BucketAccessRequest.UID == bucketAccessRequest.UID {
 			return &bucketaccess
 		}
 	}
 	return nil
+}
+
+func (b *bucketAccessRequestListener) removeBARDeleteFinalizer(ctx context.Context, bucketAccessRequest *v1alpha1.BucketAccessRequest) error {
+	newFinalizers := []string{}
+	for _, finalizer := range bucketAccessRequest.ObjectMeta.Finalizers {
+		if finalizer != util.BARDeleteFinalizer {
+			newFinalizers = append(newFinalizers, finalizer)
+		}
+	}
+	bucketAccessRequest.ObjectMeta.Finalizers = newFinalizers
+
+	_, err := b.bucketClient.ObjectstorageV1alpha1().BucketAccessRequests(bucketAccessRequest.Namespace).Update(ctx, bucketAccessRequest, metav1.UpdateOptions{})
+	return err
 }
